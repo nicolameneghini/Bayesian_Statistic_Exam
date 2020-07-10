@@ -9,7 +9,7 @@ In the paper [Vigotti, M.A., Rossi, G., Bisanti, L., Zanobetti, A. and Schwartz,
 
 ## Objectives of This Project
 
-Using the same data, I tried to answer the following questions using a Bayesian approach:
+Using the same data, I tried to answer the following questions through a Bayesian approach:
  * What the the most relevant predictors in describing the daily number of deaths?
  * Is it better to describe the response variable with a Gaussian or a Possoinian distribution?
  * Is there some nonlinearity?
