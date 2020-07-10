@@ -1,7 +1,7 @@
 # Bayesian_Statistic_Exam
 Exam project for the Course of Bayesian Statistics
 
-![Alt text](/img/cover_image.jpg?raw=true "Mortality in Milan")
+![Alt text](/img/cover_image.jpg)
 
 ## Original Paper
 
