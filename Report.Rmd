@@ -1,0 +1,938 @@
+---
+title: "Bayesian Statistics: Final Project"
+author: "Nicola Meneghini"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(SemiPar)
+library(Deducer)
+library(gridExtra)
+library(ggplot2)
+library(rstan)
+library(bayesplot)
+library(loo)
+library(rstanarm)
+
+set.seed(123)
+```
+
+
+# The Dataset
+
+```{r, echo=FALSE}
+data("milan.mort")
+keep <- nrow(milan.mort)-3
+data <- milan.mort[1:keep,]
+```
+
+
+The observations in the dataset `milan.mort` were made to check whether the presence of small particles (namely SO2 and TSP) can be associated with a higher number of deaths. The study was conducted in the city of Milan, by Vigotti, M.A., Rossi, G., Bisanti, L., Zanobetti, A. and Schwartz, J. in a paper called "Short term effect of urban air pollution on respiratory health in Milan, Italy, 1980-1989".
+
+The dataset has 9 variables: 
+
+* `day.num`: incremental number which keeps track of elapsed time;
+* `day.of.week`: factor variable which spans from 1 (monday) to 7 (sunday);
+* `holiday`: boolean for working days (0) and holiday (1);
+* `mean.temp`: average tempreature in a given day;
+* `rel.humid`: average relative humidity in a given day;
+* `tot.mort`: number of total deaths in given day;
+* `resp.mort`: number of deaths due to respiratory causes;
+* `TSP`: concentration of total suspended particulates;
+* `SO2`: concentration of sulphur dioxide
+
+Each of these quantities has been observed every day for ten years (from 1980 to 1989). This amounts to 3652 observations.
+
+Our goal is to model the time series for the dependent variable `tot.mort` using both a Gaussian and a Poissoinian likelihood. We will try to use every explanatory variables except `resp.mort` (since the information carried by this variable is somehow already included in `tot.mort`).
+
+# Exploratory Data Analysis
+
+First off, we add two more varibales:
+
+- `day.of.year`: factor variable which spans from 1 (January 1st) to 365 (December 31st);
+- `year`: factor variable which spans from 1 (1980) to 10 (1989);
+
+```{r}
+data$day.of.year = data$day.num %% 365
+data[data$day.of.year == 0, 'day.of.year'] = 365
+data$year = data$day.num %/% 365
+```
+
+Next, we plot the evolution through time of both the total and respiratory number of deaths.
+
+```{r, echo=FALSE}
+sm1 <- ggplot(data=data, aes(y=tot.mort, x=day.num)) + geom_point(col='#F8766D')+
+  geom_smooth(method = 'loess', span = .1) + scale_x_continuous(breaks = seq(0, 3650, by = 365))+
+  geom_vline(xintercept=as.numeric(data$day.num[data$day.of.year == 365]),linetype=4)
+
+sm2 <-  ggplot(data=data, aes(y=resp.mort, x=day.num)) + geom_point(col='#00BFC4')+
+  geom_smooth(method = 'loess', span = .2) +scale_x_continuous(breaks = seq(0, 3650, by = 365)) +
+  scale_y_continuous(breaks = seq(0, max(data$resp.mort)+1, by = 2))+
+  geom_vline(xintercept=as.numeric(data$day.num[data$day.of.year == 365]),linetype=4)
+
+grid.arrange(sm1,sm2, nrow=2)
+```
+
+The data are extremelly noisy, but thank to the local regression (loess) smoothing we can spot a cyclic pattern which is repeted across the ten years.
+
+
+We now plot the distribution of the dependent variables:
+
+```{r, echo=FALSE}
+h1 <- ggplot(data = data,aes(x=TSP)) + geom_histogram(aes(y=..density..), binwidth = 10) +
+  geom_density(alpha=.2)
+h2 <- ggplot(data = data,aes(x=SO2)) + geom_histogram(aes(y=..density..), binwidth = 10)+
+  geom_density(alpha=.2)
+h3 <- ggplot(data = data,aes(x=tot.mort)) + geom_histogram(aes(y=..density..), binwidth = 1)+
+  geom_density(alpha=.2 )
+h4 <- ggplot(data = data,aes(x=resp.mort)) + geom_histogram(aes(y=..density..), binwidth = 1)+
+  geom_density(alpha=.2, adjust = 2)
+h5 <- ggplot(data = data,aes(x=rel.humid)) + geom_histogram(aes(y=..density..), binwidth = 5)+
+  geom_density(alpha=.2)
+h6 <- ggplot(data = data, aes(x=mean.temp)) + geom_histogram(aes(y=..density..), binwidth = 4)+
+  geom_density(alpha=.2)
+
+grid.arrange(h1,h2,h3,h4,h5,h6, nrow=3)
+
+```
+
+We can see that `SO2` is strongly skewed suggesting that logarithmic transformation is necessary:
+
+```{r}
+data$SO2 <- log(data$SO2 + 1 + abs(min(data$SO2))) #traslation for negative values
+```
+
+
+
+On the other hand `mean.temp` shows a quite uniform distribution and `tot.mort` follows a centered bell-shaped distribution. Also we can see that the number of `resp.mort` is very low compared to `tot.mort`.
+
+Finally, we can look at the pairplot for more insights:
+
+```{r}
+cor.data <- cor.matrix(variables=d(mean.temp,rel.humid,SO2, TSP,tot.mort),
+                                   data = data)
+
+ggcorplot(
+  cor.mat = cor.data,
+  data = data,
+  line.method=c("loess"),
+  var_text_size = 3,
+  cor_text_limits = c(5,10))
+
+```
+
+We can see that the effect of the independent variables is kind of weak. This suggest narrow prior centered at zero for the slopes. Also, the smoothing highlights some nonlinearity, especially in `mean.temp`, for which we can see a minimum in the number of deaths for mild temperatures.
+
+
+
+One last assumption we are making is that `holiday` and `day.of.week` do not affect the final result. Indeed we assume an homogeneuos distribution for `tot.mort` over `day.of.week` and the same ratio of deaths on any working day or holiday. Indeed we have
+
+```{r}
+
+ggplot(data=data, aes(x = as.factor(day.of.week), y=tot.mort, fill=as.factor(day.of.week), color = as.factor(day.of.week)))+geom_bar(stat = "identity")+ggtitle(label = "Weekday Mortality Comparison")
+
+
+```
+
+
+and
+
+```{r}
+n_holidays <- sum(data[data$holiday==1,'holiday'])
+print(sum(data[data$holiday==1, 'tot.mort'])/n_holidays)
+print(sum(data[data$holiday==0, 'tot.mort'])/(nrow(data)- n_holidays))
+```
+
+Note that we exclude also a `weekend` effect because we are considering a small sample (only the city of Milan) and the impact factors such of work accidents or traffic accident is negligible.
+
+
+# Gaussian Models
+
+We now build a some models supposing a normally distributed response variable.
+
+## Initial Simple Linear Model ('G0')
+
+We start with a linear model which does not explicitly include the effect time (implicitly this information may be contained in `mean.temp`). We will use this model as the baseline.
+
+As mentioned before, we will set a gaussian with small variance for the parameters; on the other hand we will give the intercept more freedom as it may be harder to guess. Therefore the model will be
+
+$$
+\text{tot.mort} \sim \mathcal{N}(\alpha + \beta_1 \text{temp} +  \beta_2 \log\text{SO2}, \sigma^2)
+$$
+
+with the following priors
+
+$$
+\beta_i \sim \mathcal{N}(0,15)\\
+$$
+
+
+we will use the default weakly informative priors provided by `rstanarm`
+
+```{r}
+priors <- normal(location = c(0,0), scale=c(15,15), autoscale = FALSE) #prior for the slopes
+
+fitted.gaussian_regression <- stan_glm(tot.mort ~ mean.temp + SO2, data = data, family = gaussian, prior=priors )
+```
+
+We now make use replicated data to perform some checks.
+
+```{r}
+y_rep <- posterior_predict(fitted.gaussian_regression)
+```
+
+First of all we check wheter the residuals are normally distributed
+
+```{r}
+
+mean_y_rep <- colMeans(y_rep)
+std_resid <- (data$tot.mort - mean_y_rep) / sqrt(mean_y_rep)
+
+qplot(mean_y_rep, std_resid) + hline_at(2) + hline_at(-2)
+```
+
+Some large residuals are located at `mean_y_rep`$\simeq 27$, but overall they seem to be randomly distributed.
+
+Next we check on residual autocorrelation
+
+```{r}
+acf(data$tot.mort - mean_y_rep)
+```
+
+We see that The model may not be correctly specified as there is large poitive autocorellation at all lags.
+
+We now proceed with the other usual posterior predictive checks:
+
+```{r}
+ppc_dens_overlay(
+  y = sapply(data$tot.mort,as.numeric),
+  yrep = y_rep[1:200,]
+)
+```
+
+
+
+```{r}
+ppc_stat_grouped(
+  y = sapply(data$tot.mort,as.numeric), 
+  yrep = y_rep, 
+  group = data$year, 
+  stat = 'mean',
+  binwidth = 0.2
+)
+
+```
+
+
+
+We can see that the model does not perform very well: it doesn't reproduce the empirical distribution as the peak is somewhat shifted and the mean value is completely wrong in different years.
+
+The LOOIC is 
+
+```{r}
+loo_slopes1 <- loo(fitted.gaussian_regression)
+print(loo_slopes1)
+```
+
+We have seen the residuals and the mean in the `ppc_stat_grouped` plot are the two main issues with the model. Therefore we will use these together with the LOOIC as benchmarks through which test the performance of the following models. 
+
+
+## Gaussian Regression with Time 
+
+As it suggested from EDA, the time period can be important in predicting the total number of deaths. So we now explore some models which include time effect.
+
+
+### First Model Including Time ('G1')
+
+The model specification are the following:
+
+$$
+\mu = \alpha + \beta_1 \text{day.of.year} + \beta_2\text{year} + \beta_3 \text{temp} \\
+\text{tot.mort} \sim \mathcal{N}(\mu, \sigma^2)
+$$
+
+For this model we will use the default weakly informative priors of `rstanarm`.
+
+```{r}
+
+fitted.time_regression <- stan_glm(tot.mort ~ year + day.of.year + mean.temp, data = data, family = gaussian)
+
+```
+
+Again, we first look at the residuals
+
+```{r}
+y_rep2 <- posterior_predict(fitted.time_regression)
+```
+
+
+```{r}
+mean_y_rep <- colMeans(y_rep2)
+std_resid <- (data$tot.mort - mean_y_rep) / sqrt(mean_y_rep)
+qplot(mean_y_rep, std_resid) + hline_at(2) + hline_at(-2)
+```
+
+```{r}
+acf(data$tot.mort - mean_y_rep)
+```
+
+Where we see that the residuals still suffer from positive autocorrelation but to a lesser degree with respect to the base model.
+
+And then the posterior predictive checks:
+
+```{r}
+ppc_dens_overlay(
+  y = sapply(data$tot.mort, as.numeric),
+  yrep = y_rep2[1:200,]
+)
+```
+
+We can see that the replicated distribution somewhat replicate the original one, but the peaks are not aligned.
+
+```{r}
+ppc_stat_grouped(
+  y = sapply(data$tot.mort, as.numeric), 
+  yrep = y_rep2, 
+  group = as.factor(data$year), 
+  stat = 'mean',
+  binwidth = 0.2
+)
+```
+
+We can see how modelling time has helped improving both the autocorrelation and the mean estimate for each year. However we are still not satisfied with this model
+
+Finally, the LOOIC:
+
+```{r}
+loo_slopes2 <- loo(fitted.time_regression)
+loo_slopes2
+```
+
+### Best Gaussian Model with Time ('G2')
+
+After some tests, we saw that only one predictor leads to a significant reduction of LOOIC: `log(SO2)`. Adding more predictors does not carry any significant benefits and we would simply end up in having a more complex model.
+
+```{r}
+fitted.time_s02_regression <- stan_glm(tot.mort~year + day.of.year + mean.temp + SO2, data = data, family = gaussian)
+```
+
+We perform the same steps as before:
+
+```{r}
+y_rep3 <- posterior_predict(fitted.time_s02_regression)
+```
+
+
+```{r}
+mean_y_rep <- colMeans(y_rep3)
+std_resid <- (data$tot.mort - mean_y_rep) / sqrt(mean_y_rep)
+qplot(mean_y_rep, std_resid) + hline_at(2) + hline_at(-2)
+```
+
+
+```{r}
+acf(data$tot.mort - mean_y_rep)
+```
+
+
+```{r}
+#Result evaluation
+ppc_dens_overlay(
+  y = sapply(data$tot.mort, as.numeric),
+  yrep = y_rep3[1:200,]
+)
+```
+
+
+```{r}
+ppc_stat_grouped(
+  y =  sapply(data$tot.mort, as.numeric), 
+  yrep = y_rep3, 
+  group = as.factor(data$year), 
+  stat = 'mean',
+  binwidth = 0.2
+)
+```
+
+
+```{r}
+loo_slopes3 <- loo(fitted.time_s02_regression)
+loo_slopes3
+```
+
+As we can see, the only improvement we achieved is a reduction in LOOIC. Indeed, the posterior predictive check do not highlight any other significant achievement.
+
+### Nonlinear Gaussian Model ('G3')
+
+EDA suggested that some predictors may be nonlinear in predicting the total number of deaths. We therefore build a gam model to try to take into account these effects. After some attempts, we found that the minimal best model is the following
+
+```{r}
+library(rstanarm)
+
+fitted.nonlinear <- stan_gamm4(tot.mort ~ s(mean.temp) + s(day.of.year) + factor(year) + SO2,
+                                 family = gaussian, data = data)
+```
+
+
+```{r}
+y_rep4 <- posterior_predict(fitted.nonlinear)
+```
+
+
+```{r}
+mean_y_rep <- colMeans(y_rep4)
+std_resid <- (data$tot.mort - mean_y_rep) / sqrt(mean_y_rep)
+qplot(mean_y_rep, std_resid) + hline_at(2) + hline_at(-2)
+```
+
+
+```{r}
+acf(data$tot.mort - mean_y_rep)
+```
+
+We see that the autocorrelation is much smaller, but it still positive up to the 15th lag.
+
+```{r}
+ppc_dens_overlay(
+  y = sapply(data$tot.mort, as.numeric),
+  yrep = y_rep4[1:200,]
+)
+```
+
+Again, the peaks are not aligned.
+
+```{r}
+ppc_stat_grouped(
+  y = sapply(data$tot.mort, as.numeric), 
+  yrep = y_rep4, 
+  group = as.factor(data$year), 
+  stat = 'mean',
+  binwidth = 0.2
+)
+```
+
+This model finally gets the distribution of the mean centered. Let's see how it behaves with the standard deviation distributions:
+
+```{r}
+ppc_stat_grouped(
+  y = sapply(data$tot.mort, as.numeric), 
+  yrep = y_rep4, 
+  group = as.factor(data$year), 
+  stat = 'sd',
+  binwidth = 0.2
+)
+```
+
+
+```{r}
+loo_slopes4 <- loo(fitted.nonlinear)
+loo_slopes4
+```
+
+
+Up to now this is the best model: distribution of the mean is nicely cetered for each year and it achieves the smallest LOOIC. However, the replicated distributions and the residuals still show some issues.
+
+# Poissonian Models
+
+## Poisson Regression with Time 
+
+We now build some models with a Poisson distribution as likelihood. We expect this to perform better (in terms of LOOIC) as it should better represent count data. However we also expect that it will not solve the main issue of positive autocorrelation in the residuals.
+
+### First Model including Time ('P1')
+
+
+Again, we use the default weakly informative priors of `rstanarm`.
+
+
+```{r}
+
+fitted.P_time_regression <- stan_glm(tot.mort ~ year + day.of.year + mean.temp, data = data, family = poisson)
+
+```
+
+Now the residuals
+
+```{r}
+y_rep2P <- posterior_predict(fitted.P_time_regression)
+```
+
+
+```{r}
+mean_y_rep <- colMeans(y_rep2P)
+std_resid <- (data$tot.mort - mean_y_rep) / sqrt(mean_y_rep)
+qplot(mean_y_rep, std_resid) + hline_at(2) + hline_at(-2)
+```
+
+```{r}
+acf(data$tot.mort - mean_y_rep)
+```
+
+We again find positive autocorrelation in accordance with our expectation
+
+```{r}
+#Result evaluation
+ppc_dens_overlay(
+  y = sapply(data$tot.mort, as.numeric),
+  yrep = y_rep2P[1:200,]
+)
+```
+
+We can see that the posterior predictive distributions better replicates the empirical one. 
+
+```{r}
+ppc_stat_grouped(
+  y = sapply(data$tot.mort, as.numeric), 
+  yrep = y_rep2P, 
+  group = as.factor(data$year), 
+  stat = 'mean',
+  binwidth = 0.2
+)
+```
+
+Here we can see that the distribution is totally wrong for year 2,3,4 and 6.
+
+The model score is:
+
+```{r}
+loo_slopes2P <- loo(fitted.P_time_regression)
+loo_slopes2P
+```
+
+Expect for the `ppc_dens_overlay` plot, the model is worse than it gaussian counterpart
+
+### Best Poisson Model with Time ('P2')
+
+Also in the poissonian models, the `log(SO2)` predictos turns out to be the best in terms of LOOIC improvement.
+
+```{r}
+fitted.P_time_s02_regression <- stan_glm(tot.mort~year + day.of.year + mean.temp + SO2, data = data, family = poisson)
+```
+
+And now the usual model checking steps:
+
+```{r}
+y_rep3P <- posterior_predict(fitted.P_time_s02_regression)
+```
+
+
+```{r}
+mean_y_rep <- colMeans(y_rep3P)
+std_resid <- (data$tot.mort - mean_y_rep) / sqrt(mean_y_rep)
+qplot(mean_y_rep, std_resid) + hline_at(2) + hline_at(-2)
+```
+
+
+```{r}
+acf(data$tot.mort - mean_y_rep)
+```
+
+
+```{r}
+#Result evaluation
+ppc_dens_overlay(
+  y = sapply(data$tot.mort, as.numeric),
+  yrep = y_rep3P[1:200,]
+)
+```
+
+
+```{r}
+ppc_stat_grouped(
+  y =  sapply(data$tot.mort, as.numeric), 
+  yrep = y_rep3P, 
+  group = as.factor(data$year), 
+  stat = 'mean',
+  binwidth = 0.2
+)
+```
+
+
+```{r}
+loo_slopes3 <- loo(fitted.P_time_s02_regression)
+loo_slopes3
+```
+
+
+# Attempts for Improvement
+
+In contradiction with our expectations, the poissonian models gave worse results with respect to the gaussian ones. This is probably due to the fact that a Poisson model restrics it variance to be equal to the mean. Indeed, such assumption may not be suitable for these noisy data.
+
+We will therefore focus on gaussian models and try to improve them.
+
+
+### Hierarchial Gaussian Model ('GH')
+
+As a first attempt we build a hierarchial model where `year` constitute the deeper level. This should allow us to somewhat model the yearly pattern of the number of deaths. This should also take into account the slightly deacresing trend in the number of deaths:
+
+```{r, echo=FALSE}
+ggplot(data=data, aes(y=tot.mort, x=day.num)) + geom_point(col='#F8766D')+
+  geom_smooth(method = 'lm', span = .1) + scale_x_continuous(breaks = seq(0, 3650, by = 365))+
+  geom_vline(xintercept=as.numeric(data$day.num[data$day.of.year == 365]),linetype=4)
+```
+
+
+We also note that the variable `SO2` assumes different mean values every year:
+
+```{r, echo=FALSE}
+ggplot(data=milan.mort, aes(y=SO2, x=day.num)) + geom_point(col='lightgreen')+
+  geom_smooth(method = 'loess', span = .1) + scale_x_continuous(breaks = seq(0, 3650, by = 365))+
+  geom_vline(xintercept=as.numeric(milan.mort$day.num[milan.mort$day.of.year == 365]),linetype=4)
+```
+
+and therefore we will use a varying slope for this variable.
+
+In conclusion, the model specifications are:
+
+$$
+\text{tot.mort}_{yi} \sim \mathcal{N}(\mu_{y(i)} + \beta_1 \text{day}_i + \beta_2 \text{temp}_i + \kappa_{y(i)}\text{SO2}_i, \sigma)\\
+\mu_{y(i)} \sim \mathcal{N}(\alpha, \sigma_{\mu})\\
+\kappa_{y(i)} \sim \mathcal{N}(\beta_{SO2}, \sigma_{\kappa})
+$$
+
+Note that we used a `transforemed parameters` block in order to avoid divergent series.
+
+```{r, message=FALSE, warning=FALSE}
+gaussian_hier_regression <- stan_model("01GaussianHier.stan")
+```
+
+
+```{r}
+stan_data_hier <- list(
+  N = nrow(data), 
+  J = length(unique(data$year)),
+  day= data$day.of.year,
+  temp = data$mean.temp,
+  tot_mort = data$tot.mort,
+  so2 = data$SO2,
+  year_idx = data$year+1
+)
+
+fitted.gaussian_hier_regression <- sampling(gaussian_hier_regression, data = stan_data_hier)
+```
+
+##### Computational Checks
+
+
+```{r, echo =FALSE, warning=FALSE, message=FALSE}
+a1 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'alpha'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+
+a2 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'beta_day'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+a3 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'beta_temp'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+a4 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'beta_so2'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+a5 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'sigma_mu'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+a6 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'sigma_kappa'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+```
+
+
+```{r}
+grid.arrange(a1,a2,a3,a4,a5,a6, nrow=3, ncol = 2)
+```
+
+Graphically can see that overall the chains have mixed quite well
+
+```{r}
+rhats_att_def <- rhat(fitted.gaussian_hier_regression, pars = c("alpha", "beta_day", 'beta_so2', 'sigma_mu', 'sigma_kappa', 'mu_raw', 'kappa_raw'))
+mcmc_rhat(rhats_att_def)
+```
+
+Also the $\hat{R}$ mostly close to one, showing again that the chains have mixed well.
+
+```{r}
+n_eff_ratios <- neff_ratio(fitted.gaussian_hier_regression, pars = c("alpha", "beta_day", 'beta_so2', 'sigma_mu', 'sigma_kappa', 'mu_raw', 'kappa_raw'))
+
+mcmc_neff(n_eff_ratios, size = 2)
+```
+
+
+##### Result evaluation
+
+```{r}
+y_rep_hier <- as.matrix(fitted.gaussian_hier_regression, pars = "y_rep")
+```
+
+
+
+```{r}
+mean_y_rep <- colMeans(y_rep_hier)
+
+acf(data$tot.mort - mean_y_rep)
+```
+
+
+```{r}
+#Result evaluation
+ppc_dens_overlay(
+  y = stan_data_hier$tot_mort,
+  yrep = y_rep_hier[1:200,]
+)
+```
+
+
+```{r}
+ppc_stat_grouped(
+  y = stan_data_hier$tot_mort, 
+  yrep = y_rep_hier, 
+  group = as.factor(data$year), 
+  stat = 'mean',
+  binwidth = 0.2
+)
+```
+
+
+
+```{r, warning=FALSE}
+log_lik_slopes <- extract_log_lik(fitted.gaussian_hier_regression)
+loo_slopes_hier <- loo(log_lik_slopes, 
+                   r_eff=relative_eff(exp(log_lik_slopes),rep(c(1,2,3,4),each=1000)))
+loo_slopes_hier
+```
+
+
+
+Now the distributions of `ppc_stat_grouped` are centered, but overall the model does not seem to improve that much. 
+
+We can see that the variances of the varying slope and intercept are significantly different from zero:
+
+```{r}
+p1 <- mcmc_hist(
+  as.matrix(fitted.gaussian_hier_regression, pars = "sigma_mu"),
+  binwidth = 0.05
+)
+
+p2 <- mcmc_hist(
+  as.matrix(fitted.gaussian_hier_regression, pars = "alpha"),
+  binwidth = 0.05
+)
+
+grid.arrange(p1,p2, nrow=1)
+```
+
+```{r}
+p1 <- mcmc_hist(
+  as.matrix(fitted.gaussian_hier_regression, pars = "sigma_kappa"),
+  binwidth = 0.05
+)
+
+p2 <- mcmc_hist(
+  as.matrix(fitted.gaussian_hier_regression, pars = "beta_so2"),
+  binwidth = 0.05
+)
+
+grid.arrange(p1,p2, nrow=1)
+```
+
+This suggests us that the random slope slopes and interceptes are important to explain the variability in the model and therefore we try to keep improving this model.
+
+
+### Hierarchical Gaussian Model with Autoregressive Effect ('GHAR')
+
+Up to now we have included time in our models in a naive way. We now try to include an autoregressive daily effect.
+
+$$
+\text{tot.mort}_{yt} \sim \mathcal{N}(\mu_{y} +  \text{day}_t + \beta_2 \text{temp} + \kappa_{y}\text{SO2}, \sigma)\\
+\text{day}_t = \rho \text{day}_{t-1} + \epsilon_t, \text{          } \epsilon_t \sim \mathcal{N(0,\sigma_{day})}\\
+\rho \in [-1,1]
+$$
+Note that while in the previous model $\text{day}$ was equal to `day.of.year`, now it is equal to `day.num`.
+
+We also have
+
+$$
+\text{day}_1 \sim \mathcal{N}({0, {\sigma_{day}}}/{\sqrt{1 - \rho^2}})
+$$
+and
+
+$$
+\rho_{raw} \in [0,1]\\
+\rho = 2 \times \rho_{raw} -1\\
+\rho_{raw} \sim \mathcal{Beta}(3,2)
+$$
+
+
+
+
+
+```{r, message=FALSE, warning=FALSE}
+gaussian_autor_regression <- stan_model("02GaussianHierAuto.stan")
+```
+
+
+```{r}
+stan_data_auto <- list(
+  N = nrow(data), 
+  J = length(unique(data$year)),
+  D = max(data$day.num),
+  day_idx = data$day.num,
+  temp = data$mean.temp,
+  tot_mort =  data$tot.mort,
+  so2 = data$SO2,
+  year_idx = data$year+1
+)
+
+fitted.gaussian_autor_regression <- sampling(gaussian_autor_regression, data = stan_data_auto)
+```
+
+
+##### Computational Checks
+
+
+```{r, echo =FALSE, warning=FALSE, message=FALSE}
+a1 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'alpha'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+
+a2 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'beta_day'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+a3 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'beta_temp'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+a4 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'beta_so2'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+a5 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'sigma_mu'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+a6 <- mcmc_trace(
+  as.array(fitted.gaussian_hier_regression,pars = 'sigma_kappa'),
+  np = nuts_params(fitted.gaussian_hier_regression),
+  window = c(500,1000)
+)
+```
+
+
+```{r}
+grid.arrange(a1,a2,a3,a4,a5,a6, nrow=3, ncol = 2)
+```
+
+
+```{r}
+rhats_att_def <- rhat(fitted.gaussian_hier_regression, pars = c("alpha", "beta_day", 'beta_so2', 'sigma_mu', 'sigma_kappa', 'mu_raw', 'kappa_raw'))
+mcmc_rhat(rhats_att_def)
+```
+
+
+```{r}
+n_eff_ratios <- neff_ratio(fitted.gaussian_hier_regression, pars = c("alpha", "beta_day", 'beta_so2', 'sigma_mu', 'sigma_kappa', 'mu_raw', 'kappa_raw'))
+
+mcmc_neff(n_eff_ratios, size = 2)
+```
+
+Also here we do not have any convergence or efficiency issue.
+
+
+##### Result evaluation
+
+```{r}
+y_rep_autor <- as.matrix(fitted.gaussian_autor_regression, pars = "y_rep")
+```
+
+
+```{r}
+mean_y_rep <- colMeans(y_rep_autor)
+acf(data$tot.mort - mean_y_rep)
+```
+
+
+```{r}
+ppc_dens_overlay(
+  y = sapply(data$tot.mort, as.numeric),
+  yrep = y_rep_autor[1:200,]
+)
+```
+
+Here we check the `mean`
+
+```{r}
+ppc_stat_grouped(
+  y = sapply(data$tot.mort, as.numeric), 
+  yrep = y_rep_autor, 
+  group = as.factor(data$year), 
+  stat = 'mean',
+  binwidth = 0.2
+)
+```
+
+and here the `sd`:
+
+```{r}
+ppc_stat_grouped(
+  y = sapply(data$tot.mort, as.numeric), 
+  yrep = y_rep_autor, 
+  group = as.factor(data$year), 
+  stat = 'sd',
+  binwidth = 0.2
+)
+```
+
+these plots are better with respect to the ones of the GAM model.
+
+
+
+```{r}
+
+log_lik_slopes <- extract_log_lik(fitted.gaussian_autor_regression)
+loo_slopes_autor <- loo(log_lik_slopes, 
+                   r_eff=relative_eff(exp(log_lik_slopes),rep(c(1,2,3,4),each=1000)))
+loo_slopes_autor
+
+```
+
+
+
+We can see that this model outperforms all the previus ones. It also manges to achieve centered distriution for both the standard deviation and the mean for every year. However, the pakes of the empirical distribution and that of the replicated distributiions are still somewhat misaligned.
+
+# Conclusions
+
+The data are very noisy and quite hard to model. Throughout this analysis we however managed to find out some aspects about the generative process. First of all we saw how a Gaussian likelihood is much more effective in describing the outcome, in spite of the fact that a Poisson should more suitable when dealing with count variables. Second, we saw that `mean.temp` and `SO2` have the most significant effect on the overall mortality, while `TSP` and `rel.humid` don't. We also saw that, because of the ciclical intrinsic nature of the data, time is an important predictor. 
+
+In addition, the GAM model that `mean.temp` has a nonlinear effect which can be effectively described through the spline based smooth `s()`.
+
+Finally, we managed to solve the autocorrelation in the residuals including an autogression on each day.
+
+The obvious next step is to include the smoothing function in the hierarchical autoregressive model. However it would be interesting to explore different generative processes, such as the Negative Binomial, and models that are by nature more suitable for time series, such as ARIMA. In any case, adding more predictors (age, number of smokers) should definitly help in understanding the mortality in the city of Milan.
+
+
+
+
+
+
+
