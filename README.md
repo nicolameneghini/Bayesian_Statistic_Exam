@@ -1,7 +1,7 @@
 # Bayesian_Statistic_Exam
 Exam project for the Course of Bayesian Statistics
 
-![Alt text](img/cover_image.jpg?raw=true "Mortality in Milan")
+![Alt text](/img/cover_image.jpg?raw=true "Mortality in Milan")
 
 ## Original Paper
 
@@ -21,3 +21,5 @@ I explored the following solutions:
  * GLM (Poisson family)
  * Hierarchial Model (with Gaussian response)
  * Hierarchial Model with an Autoregressive effect (with Gaussian response)
+
+The results are reported in the html file.
