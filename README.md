@@ -1,7 +1,7 @@
 # Bayesian_Statistic_Exam
 Exam project for the Course of Bayesian Statistics
 
-![Alt text](/img/cover_image.jpg)
+![Alt text](/img/cover_image.png?raw=true "Mortality in Milan (1980-1989)")
 
 ## Original Paper
 
